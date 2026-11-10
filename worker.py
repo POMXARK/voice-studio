@@ -28,7 +28,9 @@ def prog(state, k, total, cur=""):
     per = spent / proc_n if proc_n else None
     pf = jd / (f"progress_{IDX}.json" if sys.argv[1] == "gen" else "progress.json"); tmp = pf.with_suffix(".tmp%d" % IDX)
     tmp.write_text(json.dumps({"state": state, "done": k, "total": total, "cur": cur, "per_item": None if per is None else round(per, 1), "eta_min": None if per is None else round(per * (total - k) / 60, 1), "t": time.time(), "pid": os.getpid(), "model": MODEL, "vram": _vram()}, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, pf)
+    for i in range(20):   # Windows: замена запрещена, пока сервер/антивирус держит файл открытым (WinError 5) — ждём; прогресс не стоит падения генерации
+        try: os.replace(tmp, pf); return
+        except PermissionError: time.sleep(0.05)
 done_keys_start = set(done_keys)
 _tc = {}
 def tsv_text(ref):   # texts_<язык>.tsv лежит рядом с папкой <язык>_wav; имя образца = имя файла

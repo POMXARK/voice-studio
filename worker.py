@@ -205,7 +205,13 @@ elif sys.argv[1] == "gen":
                         try: w, sr = synth(it["text"], it["ref"]["wav"], it["ref"]["text"], it["params"]); save(k, it, w, sr, time.time() - t1); streak = 0
                         except Exception as e2: fail(k, it, e2)
                 else: fail(g[0][0], g[0][1], e)
-        spent += time.time() - ts; prog("running", proc_n, N, batch[-1][1]["name"])
+        spent += time.time() - ts; prog("running", proc_n, N, batch[-1][1]["name"]); vram_guard()
+    def vram_guard():   # Windows не даёт OOM, а докладывает ОЗУ вместо видеопамяти (sysmem fallback) — генерация падает в 5–10 раз; кэш аллокатора разрастается после длинных реплик
+        tc = sys.modules.get("torch")
+        if not tc or not tc.cuda.is_available(): return
+        res, tot = tc.cuda.memory_reserved(), tc.cuda.mem_get_info()[1]
+        if res > tot - (2 << 30):
+            tc.cuda.empty_cache(); say(f"видеопамять: кэш {res >> 20} МБ из {tot >> 20} — сброшен до {tc.cuda.memory_reserved() >> 20} МБ")
     batch = []
     for k, it in enumerate(job["items"], 1):
         n = it["name"]

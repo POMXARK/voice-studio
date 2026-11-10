@@ -177,16 +177,28 @@ def progress(jid):
     rate = sum(1 / p["per_item"] for p in act if p.get("per_item")); per = round(1 / rate, 1) if rate else None
     return {"state": state, "done": done, "total": total, "cur": max(ps, key=lambda x: x[1].get("t", 0))[1].get("cur", ""), "per_item": per,
             "eta_min": None if per is None else round(per * (total - done) / 60, 1), "workers": len(act), "model": (act[0].get("model") if act else None), "vram": sum(p.get("vram", 0) for p in act)}
+def _kill(p):   # venv-лаунчер fq5\Scripts\python.exe запускает настоящий python дочерним — terminate() убил бы только лаунчер
+    if p is None or p.poll() is not None: return
+    if os.name == "nt": subprocess.run(["taskkill", "/f", "/t", "/pid", str(p.pid)], capture_output=True)
+    else: p.terminate()
+def _orphans(jid):   # потоки этой задачи, которых сервер уже не помнит (гонка перезапусков, перезапуск сервера)
+    if os.name != "nt": return []
+    q = f"Get-CimInstance Win32_Process -Filter \"name='python.exe'\" | ? {{ $_.CommandLine -like '*worker.py gen*\\{jid}\\job.json*' }} | % {{ $_.ProcessId }}"
+    r = subprocess.run(["powershell", "-NoProfile", "-Command", q], capture_output=True, text=True)
+    return [int(x) for x in r.stdout.split() if x.isdigit()]
 def stop_job(j):
-    for p in (j.get("procs") or {}).values(): p.poll() is None and p.terminate()
-    if j["proc"] is not None and j["proc"].poll() is None: j["proc"].terminate()
+    for p in (j.get("procs") or {}).values(): _kill(p)
+    _kill(j["proc"])
+    for pid in _orphans(j["id"]): subprocess.run(["taskkill", "/f", "/t", "/pid", str(pid)], capture_output=True)
     for f in (ST / "jobs" / j["id"]).glob("progress_*.json"):   # потоки, пережившие перезапуск сервера
         pid = _rj(f).get("pid")
         if pid and _fresh(f): subprocess.run(["taskkill", "/f", "/pid", str(pid)], capture_output=True) if os.name == "nt" else os.kill(pid, 15)
     for f in (ST / "jobs" / j["id"]).glob("progress*.json"):   # процесс убит — иначе свежий файл прогресса ещё 90 с считается «живым» и блокирует продолжение
         d = _rj(f)
         if d: d["state"] = "exited"; f.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+RESTART_LOCK = threading.Lock()   # два переключения режима подряд (HTTP-сервер многопоточный) запускали по потоку каждое — второй оставался сиротой и делил видеопамять
 def restart_gen():
+  with RESTART_LOCK:
     for j in list(JOBS.values()):
         if j["kind"] != "gen" or not alive(j) or not j.get("py"): continue
         if progress(j["id"]).get("state") == "paused": continue   # на паузе: новый режим применится при «Продолжить»

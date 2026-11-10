@@ -1,0 +1,13 @@
+{
+ "work": "C:\\voice\\project",
+ "game_dir": "C:\\Games\\MyGame\\voice_ru",
+ "score_python": "python",
+ "prep_python": "python",
+ "campplus": "C:\\CosyVoice\\pretrained_models\\Fun-CosyVoice3-0.5B\\campplus.onnx",
+ "host": "127.0.0.1",
+ "port": 8777,
+ "tools": {
+  "vgm": "C:\\tools\\vgmstream\\vgmstream-cli.exe",
+  "ffmpeg": "C:\\tools\\ffmpeg\\bin\\ffmpeg.exe"
+ }
+}

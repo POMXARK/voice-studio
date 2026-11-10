@@ -1,0 +1,50 @@
+{
+ "models": [
+  {
+   "id": "qwen3-1.7b",
+   "name": "Qwen3-TTS 1.7B Base",
+   "adapter": "qwen3",
+   "python": "python",
+   "model": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+   "note": "одна авторегрессионная LM по токенам кодека 12 Гц; лучший тембр, чувствителен к плохому образцу",
+   "params": {
+    "temperature": 0.9,
+    "top_p": 1.0,
+    "top_k": 50,
+    "repetition_penalty": 1.05,
+    "seed": 1,
+    "tail": true,
+    "non_streaming": true
+   }
+  },
+  {
+   "id": "qwen3-0.6b",
+   "name": "Qwen3-TTS 0.6B Base",
+   "adapter": "qwen3",
+   "python": "python",
+   "model": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+   "note": "та же схема, быстрее и легче, хуже тембр",
+   "params": {
+    "temperature": 0.9,
+    "top_p": 1.0,
+    "top_k": 50,
+    "repetition_penalty": 1.05,
+    "seed": 1,
+    "tail": true,
+    "non_streaming": true
+   }
+  },
+  {
+   "id": "cosyvoice3",
+   "name": "CosyVoice 3 0.5B",
+   "adapter": "cosyvoice3",
+   "python": "python",
+   "repo": "C:\\CosyVoice",
+   "model": "pretrained_models/Fun-CosyVoice3-0.5B",
+   "note": "LM речевых токенов + flow-matching + вокодер; стабильная длина, слабее держит тембр между языками",
+   "params": {
+    "seed": 1
+   }
+  }
+ ]
+}

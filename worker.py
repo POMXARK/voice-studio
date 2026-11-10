@@ -176,7 +176,7 @@ elif sys.argv[1] == "gen":
                     except Exception: wh = whisper_model()
                 if hasattr(wh, "backend"): rt_cache[ck] = wh.transcribe([audio16(ref["wav"])], lang=ref.get("lang") or None, beam=5, batch=1)[0]
                 else: seg, _ = wh.transcribe(audio16(ref["wav"]), language=ref.get("lang") or None, beam_size=5); rt_cache[ck] = " ".join(s.text.strip() for s in seg).strip()
-                say("  расшифровка образца:", rt_cache[ck])
+                say("  расшифровка образца:", rt_cache[ck]); WH_T[0] = time.time()
             ref["text"] = rt_cache[ck]
         return ref
     def save(k, it, w, sr, sec):
@@ -212,10 +212,14 @@ elif sys.argv[1] == "gen":
                         except Exception as e2: fail(k, it, e2)
                 else: fail(g[0][0], g[0][1], e)
         spent += time.time() - ts; prog("running", proc_n, N, batch[-1][1]["name"]); vram_guard()
+    WH_T = [0.0]   # когда Whisper последний раз понадобился
     def vram_guard():   # Windows не даёт OOM, а докладывает ОЗУ вместо видеопамяти (sysmem fallback) — генерация падает в 5–10 раз; кэш аллокатора разрастается после длинных реплик
+        global wh
         tc = sys.modules.get("torch")
         if not tc or not tc.cuda.is_available(): return
         res, tot = tc.cuda.memory_reserved(), tc.cuda.mem_get_info()[1]
+        if wh is not None and (time.time() - WH_T[0] > 60 or res > tot - (2 << 30)):   # Whisper (~3 ГБ) нужен только образцам без расшифровки — минуту не нужен или тесно: выгружаем, понадобится — загрузится снова
+            wh = None; import gc; gc.collect(); tc.cuda.empty_cache(); say(f"Whisper выгружен: видеопамять {res >> 20} → {tc.cuda.memory_reserved() >> 20} МБ"); return
         if res > tot - (2 << 30):
             tc.cuda.empty_cache(); say(f"видеопамять: кэш {res >> 20} МБ из {tot >> 20} — сброшен до {tc.cuda.memory_reserved() >> 20} МБ")
     batch = []

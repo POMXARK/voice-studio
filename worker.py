@@ -171,8 +171,12 @@ elif sys.argv[1] == "gen":
         if ref.get("text") is None:
             ck = tuple(ref.get("wavs") or [ref["wav"]])   # один образец у многих реплик — слушаем один раз
             if ck not in rt_cache:
-                wh = wh or whisper_model(); seg, _ = wh.transcribe(audio16(ref["wav"]), language=ref.get("lang") or None, beam_size=5)
-                rt_cache[ck] = " ".join(s.text.strip() for s in seg).strip(); say("  расшифровка образца:", rt_cache[ck])
+                if wh is None:   # в venv быстрых режимов (fq5) нет faster-whisper — берём свой asr_batch (transformers), он есть в обоих
+                    try: from asr_batch import ASR; wh = ASR(ASR_MODEL)
+                    except Exception: wh = whisper_model()
+                if hasattr(wh, "backend"): rt_cache[ck] = wh.transcribe([audio16(ref["wav"])], lang=ref.get("lang") or None, beam=5, batch=1)[0]
+                else: seg, _ = wh.transcribe(audio16(ref["wav"]), language=ref.get("lang") or None, beam_size=5); rt_cache[ck] = " ".join(s.text.strip() for s in seg).strip()
+                say("  расшифровка образца:", rt_cache[ck])
             ref["text"] = rt_cache[ck]
         return ref
     def save(k, it, w, sr, sec):

@@ -464,7 +464,7 @@ def state_json(q="", flt="all", limit=300, off=0, sort="", where="all"):
     for x in jobs:
         if x["running"] and x.get("state") == "exited": x["state"] = "loading"   # процесс запущен, модель ещё грузится, прогресс прошлого запуска устарел
     return {"lines": lines, "off": off, "total": len(allv), "matched": len(vis), "models": load_models(), "langs": LG, "samples": S["samples"], "defaults": S["defaults"], "jobs": jobs, "auto": AUTO, "threads": THR, "asr_n": len(asr_items()) if not any(j["kind"] == "asr" and alive(j) for j in JOBS.values()) else 0, "stage_msg": STAGE["msg"], "stage_busy": STAGE["busy"], "autoinst": {**(S.get("autoinst") or {"on": False, "every": 60}), **{k: v for k, v in AINST.items() if k != "t"}},
-            "stages": {k: len(v) for k, v in stage_lists(allv, S).items()}, "adapters": __import__("prep").ADAPTERS, "prep_last": S.get("prep", {}), "game_dir": CFG["game_dir"]}
+            "stages": {k: len(v) for k, v in stage_lists(allv, S).items()}, "inst": install_stage(S), "adapters": __import__("prep").ADAPTERS, "prep_last": S.get("prep", {}), "game_dir": CFG["game_dir"]}
 AINST = {"last": "", "n": 0, "msg": ""}
 def _sig(src):
     try: st = src.stat(); return [str(src), st.st_size, int(st.st_mtime)]
@@ -474,34 +474,122 @@ def _put(src, dst):
     dst.unlink(missing_ok=True)
     try: os.link(src, dst)
     except OSError: shutil.copy(src, dst)
+AUD_EXT = ("wem", "mp3", "wav", "flac")   # порядок поиска в VoiceLayer: первый найденный играет, остальные убираем
+def _enc(src, dst):
+    """дубль → mp3 для игры: WAV 24 кГц без сжатия занимает 48 КБ/с, mp3 64 кбит/с — 8 КБ/с (в 6 раз меньше), VoiceLayer читает mp3 через miniaudio"""
+    tmp = dst.with_name(dst.stem + ".part.mp3")
+    r = subprocess.run([CFG["tools"]["ffmpeg"], "-y", "-loglevel", "error", "-i", str(src), "-ac", "1", "-c:a", "libmp3lame", "-b:a", f"{CFG.get('install_kbps', 64)}k", str(tmp)], capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if r.returncode or not tmp.exists(): tmp.unlink(missing_ok=True); raise OSError(r.stderr.decode("utf-8", "replace")[-200:] or "ffmpeg failed")
+    os.replace(tmp, dst)
+_LED = {"k": None, "d": {}}
+INST_LOCK = threading.Lock(); INST = {"run": False, "k": 0, "n": 0, "t": 0.0}
+def led_load():   # installed.json (12 МБ) читаем заново только при изменении: его смотрит каждый опрос интерфейса
+    f = W / "installed.json"
+    try: k = (f.stat().st_mtime_ns, f.stat().st_size)
+    except OSError: return {}
+    if _LED["k"] != k:
+        try: _LED["d"] = json.loads(f.read_text(encoding="utf-8")); _LED["k"] = k
+        except Exception: pass
+    return _LED["d"]
+_GSZ = [0.0, {}]
+def game_size():   # размер папки игры по расширениям: обход 60 тыс. файлов — раз в минуту
+    if time.time() - _GSZ[0] > 60:
+        out = {}
+        try:
+            with os.scandir(CFG["game_dir"]) as it:
+                for e in it:
+                    x = e.name.rsplit(".", 1)[-1].lower(); c = out.setdefault(x, [0, 0]); c[0] += 1; c[1] += e.stat().st_size
+        except OSError: pass
+        _GSZ[:] = [time.time(), out]
+    return _GSZ[1]
+_IST = [0.0, None]
+def install_stage(S):
+    """этап «в игру»: сколько выбранных реплик уже в игре в нужном формате и сколько ждёт; счёт по 60 тыс. реплик — не чаще раза в 5 с"""
+    if time.time() - _IST[0] > 5 or _IST[1] is None: _IST[:] = [time.time(), _inst_count(S)]
+    return {**_IST[1], "fmt": CFG.get("install_format", "mp3"), "kbps": CFG.get("install_kbps", 64), "size": game_size(), "run": INST["run"], "k": INST["k"], "n": INST["n"], "msg": AINST.get("msg", "")}
+def _inst_count(S):
+    led = led_load(); fmt = CFG.get("install_format", "mp3"); ok = pend = 0
+    for n, L in S["lines"].items():
+        c = L.get("chosen")
+        if not c or (L.get("flag") == "bad" and c != "dub"): continue
+        v = led.get(n); want = "wem" if c == "dub" else fmt
+        if v and v[-1] == want: ok += 1
+        else: pend += 1
+    return {"ok": ok, "pending": pend}
+def install_bg(only_new=True):
+    if INST["run"]: return False
+    threading.Thread(target=install, args=(None, only_new), daemon=True).start(); return True
+def _enc_many(pairs):
+    """пачка дублей одним ffmpeg (N входов → N выходов): запуск процесса на Windows дороже самого кодирования, по одному файлу выходило ~26 реплик/с"""
+    a = [CFG["tools"]["ffmpeg"], "-y", "-loglevel", "error"]
+    for src, _ in pairs: a += ["-i", str(src)]
+    tmps = [d.with_name(d.stem + ".part.mp3") for _, d in pairs]
+    for i, t in enumerate(tmps): a += ["-map", f"{i}:a", "-ac", "1", "-c:a", "libmp3lame", "-b:a", f"{CFG.get('install_kbps', 64)}k", str(t)]
+    r = subprocess.run(a, capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)); ok = []
+    for (src, d), t in zip(pairs, tmps):
+        if not r.returncode and t.exists() and t.stat().st_size: os.replace(t, d); ok.append(d)
+        else: t.unlink(missing_ok=True)
+    return ok
 def install(names=None, only_new=False):
+    if not INST_LOCK.acquire(timeout=1): return []   # одна установка за раз: ручная и авто не пишут в папку игры одновременно
+    try:
+        INST.update(run=True, k=0, n=0, t=time.time()); return _install(names, only_new)
+    finally: INST["run"] = False; _GSZ[0] = 0; INST_LOCK.release()
+def _install(names=None, only_new=False):
     """отдаёт выбранные дубли в папку игры; only_new — по таблице installed.json пропускает уже установленное без повторного копирования"""
-    S = load_state(); gd = Path(CFG["game_dir"]); gd.mkdir(parents=True, exist_ok=True); done = []
+    S = load_state(); gd = Path(CFG["game_dir"]); gd.mkdir(parents=True, exist_ok=True); done = []; todo = []
     led_f = W / "installed.json"
-    try: led = json.loads(led_f.read_text(encoding="utf-8"))
-    except Exception: led = {}
+    led = dict(led_load())
     for n, L in S["lines"].items():
         if names and n not in names: continue
         c = L.get("chosen")
         if L.get("flag") == "bad" and c != "dub": continue   # плохие не отдаём в игру
         try:
-            if c == "dub" and (W / "dub_wem" / f"{n}.wem").exists(): src, ext, other = W / "dub_wem" / f"{n}.wem", "wem", "wav"
+            if c == "dub" and (W / "dub_wem" / f"{n}.wem").exists(): src, ext = W / "dub_wem" / f"{n}.wem", "wem"
             elif c:
                 t = next((t for t in L.get("takes", []) if t["take"] == c), None)
                 if not t: continue
-                src, ext, other = Path(t["file"]), "wav", "wem"   # .wem в Dir имеет приоритет над .wav, старую убираем
+                src, ext = Path(t["file"]), CFG.get("install_format", "mp3")   # mp3 (сжатие) или wav (жёсткая ссылка на дубль)
             else: continue
             sg = _sig(src)
             if sg is None: continue
             if only_new and led.get(n) == sg + [ext]: continue
-            (gd / f"{n}.{other}").unlink(missing_ok=True); _put(src, gd / f"{n}.{ext}"); led[n] = sg + [ext]; done.append(n)
+            todo.append((n, src, ext, sg))
         except OSError as e: AINST["msg"] = f"{n}: {e}"
+    def fin(n, ext):
+        for o in AUD_EXT:
+            if o != ext: (gd / f"{n}.{o}").unlink(missing_ok=True)
+    def one(batch):   # пачка реплик: mp3 — одним ffmpeg, остальное — ссылкой/копией
+        res = []; enc = []
+        for n, src, ext, sg in batch:
+            dst = gd / f"{n}.{ext}"
+            try:
+                if ext == "mp3" and src.suffix.lower() != ".mp3":
+                    if dst.exists() and dst.stat().st_mtime >= src.stat().st_mtime and dst.stat().st_size: fin(n, ext); res.append((n, sg + [ext])); continue   # уже перекодирован прошлым прогоном
+                    enc.append((n, src, ext, sg)); continue
+                _put(src, dst); fin(n, ext); res.append((n, sg + [ext]))
+            except OSError as e: AINST["msg"] = f"{n}: {e}"
+        if enc:
+            ok = set(_enc_many([(src, gd / f"{n}.{ext}") for n, src, ext, sg in enc]))
+            for n, src, ext, sg in enc:
+                d = gd / f"{n}.{ext}"
+                if d not in ok:
+                    try: _enc(src, d)   # пачка упала (битый файл) — этот по одному
+                    except OSError as e: AINST["msg"] = f"{n}: {e}"; continue
+                fin(n, ext); res.append((n, sg + [ext]))
+        return len(batch), res
+    from concurrent.futures import ThreadPoolExecutor
+    INST["n"] = len(todo); B = int(CFG.get("install_batch", 24)); k = 0; last = 0
+    with ThreadPoolExecutor(int(CFG.get("install_threads", 8))) as ex:
+        for m, res in ex.map(one, [todo[i:i + B] for i in range(0, len(todo), B)]):
+            k += m; INST["k"] = k
+            for n, v in res: led[n] = v; done.append(n)
+            if k - last >= 2000: last = k; led_f.write_text(json.dumps(led, ensure_ascii=False), encoding="utf-8"); AINST["msg"] = f"в игру {k}/{len(todo)}"
     if done: led_f.write_text(json.dumps(led, ensure_ascii=False), encoding="utf-8")
     return done
 def pending_count():
     S = load_state()
-    try: led = json.loads((W / "installed.json").read_text(encoding="utf-8"))
-    except Exception: led = {}
+    led = led_load()
     return sum(1 for n, L in S["lines"].items() if L.get("chosen") and n not in led and not (L.get("flag") == "bad" and L.get("chosen") != "dub"))
 def autoinst_loop():   # отдаёт в игру новые готовые реплики: раз в N секунд или когда накопилось K новых
     while True:
@@ -644,7 +732,9 @@ class H(BaseHTTPRequestHandler):
                 save_state(S)
             return self.send(200, {"jobs": jobs})
         if u.path == "/api/score": return self.send(200, {"jobs": score(d["names"])})
-        if u.path == "/api/install": return self.send(200, {"installed": install(d.get("names"))})
+        if u.path == "/api/install":
+            if d.get("bg"): return self.send(200, {"started": install_bg(bool(d.get("only_new", True)))})
+            return self.send(200, {"installed": install(d.get("names"))})
         if u.path == "/api/uninstall":
             gd = Path(CFG["game_dir"]); n = 0
             for nm in d["names"]:

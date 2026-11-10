@@ -12,6 +12,11 @@ import os
 
 MODELS = {"large-v3": "openai/whisper-large-v3", "large-v3-turbo": "openai/whisper-large-v3-turbo"}
 
+def _clean(t):   # как в самом Whisper (compression_ratio_threshold 2.4): текст из повторов — галлюцинация на неречевом звуке; пустой текст → Qwen клонирует только тембр (x-vector)
+    import zlib
+    b = t.encode("utf-8")
+    return "" if len(b) > 24 and len(b) / len(zlib.compress(b)) > 2.4 else t
+
 class ASR:
     def __init__(self, name="large-v3", backend=None):
         self.backend = backend or os.environ.get("STUDIO_ASR", "hf")
@@ -35,14 +40,15 @@ class ASR:
         for b in range(0, len(short), batch):
             ids = short[b:b + batch]
             for i, t in zip(ids, self._batch([audios[i] for i in ids], lang, beam)): out[i] = t.strip()
-        return out
+        return [_clean(t) for t in out]
 
     def _batch(self, xs, lang, beam):
         if self.backend == "hf":
             torch = self.torch
             f = self.P.feature_extractor(xs, sampling_rate=16000, return_tensors="pt").input_features.to("cuda", torch.float16)
             with torch.inference_mode():
-                ids = self.M.generate(f, language=lang, task="transcribe", num_beams=beam, do_sample=False)
+                cap = min(440, 16 + int(20 * max(len(x) for x in xs) / 16000))   # ~20 токенов/с с запасом: на крике/шуме Whisper зацикливается до 448 токенов (~20 с на образец)
+                ids = self.M.generate(f, language=lang, task="transcribe", num_beams=beam, do_sample=False, max_new_tokens=cap)
             return self.P.batch_decode(ids, skip_special_tokens=True)
         import numpy as np
         from faster_whisper.audio import pad_or_trim

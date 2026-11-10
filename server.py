@@ -18,10 +18,37 @@ def rd_tsv(p):   # с кэшем по времени изменения: у по
     if _TSV.get(p, (None,))[0] != k: _TSV[p] = (k, dict(l.split("\t", 1) for l in p.read_text(encoding="utf-8").splitlines() if "\t" in l))
     return _TSV[p][1]
 def load_models(): return json.loads((HERE / "models.json").read_text(encoding="utf-8"))["models"]
+_ST = {"S": None, "k": None, "dirty": False, "t": 0.0}   # studio.json (~50 МБ на 60 тыс. реплик) держим в памяти: разбор и запись на каждый опрос интерфейса (2,5 с) доходили до 22 с
+def _skey(p):
+    try: st = p.stat(); return (st.st_mtime_ns, st.st_size)
+    except OSError: return None
 def load_state():
     p = W / "studio.json"
-    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {"lines": {}, "samples": {}, "defaults": {"model": "qwen3-1.7b", "ref": {"src": "lang", "lang": "ja"}}}
-def save_state(s): (W / "studio.json.tmp").write_text(json.dumps(s, ensure_ascii=False, indent=1), encoding="utf-8"); os.replace(W / "studio.json.tmp", W / "studio.json")
+    with LOCK:
+        if _ST["S"] is not None and not _ST["dirty"] and _skey(p) != _ST["k"]: _ST["S"] = None   # файл правили снаружи — перечитать
+        if _ST["S"] is None:
+            _ST["S"] = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {"lines": {}, "samples": {}, "defaults": {"model": "qwen3-1.7b", "ref": {"src": "lang", "lang": "ja"}}}; _ST["k"] = _skey(p)
+        return _ST["S"]
+def save_state(s, now=False):   # в память сразу, на диск — не чаще раза в 15 с (поток flush_loop); results.jsonl воркеров всё равно хранит каждый дубль
+    with LOCK:
+        _ST["S"] = s; _ST["dirty"] = True
+        if now: flush_state()
+def flush_state():
+    p = W / "studio.json"
+    with LOCK:
+        if not _ST["dirty"]: return
+        for _ in range(5):
+            try: txt = json.dumps(_ST["S"], ensure_ascii=False); break
+            except RuntimeError: time.sleep(0.05)   # другой поток как раз меняет словарь
+        else: return
+        try: (W / "studio.json.tmp").write_text(txt, encoding="utf-8"); os.replace(W / "studio.json.tmp", p)
+        except OSError: return   # Windows: файл кто-то держит открытым — запишем в следующий раз
+        _ST["k"] = _skey(p); _ST["dirty"] = False; _ST["t"] = time.time()
+def flush_loop():
+    while True:
+        time.sleep(15)
+        try: flush_state()
+        except Exception as e: print("flush_state:", e, flush=True)
 _LG = [0, []]
 def langs():   # кэш на 3 с: при запуске 60 тыс. реплик вызывается на каждую
     if time.time() - _LG[0] > 3: _LG[:] = [time.time(), sorted(p.name[:-4] for p in W.glob("*_wav") if p.name != "dub_wav" and p.is_dir())]
@@ -104,8 +131,13 @@ def ingest():   # забрать результаты воркеров в studio
         for jid, j in JOBS.items():
             rp = ST / "jobs" / jid / "results.jsonl"
             if not rp.exists(): continue
-            rows = rp.read_text(encoding="utf-8").splitlines()
-            for r in parse_rows(rows[j["pos"]:]):
+            bp = j.get("bpos", 0)
+            if rp.stat().st_size < bp: bp = 0   # файл пересоздан
+            with open(rp, "rb") as f: f.seek(bp); data = f.read()   # дочитываем только новое: целиком это 40+ МБ на каждый опрос
+            end = data.rfind(b"\n") + 1   # недописанную воркером строку оставляем на следующий раз
+            if not end: continue
+            j["bpos"] = bp + end
+            for r in parse_rows(data[:end].decode("utf-8", "replace").splitlines()):
                 L = S["lines"].setdefault(r["name"], {}); ch = True
                 if r["kind"] == "take":
                     if any(t["take"] == r["take"] for t in L.get("takes", [])): continue
@@ -116,7 +148,6 @@ def ingest():   # забрать результаты воркеров в studio
                     for t in L.get("takes", []):
                         if t["take"] == r["take"]: t.update({k: r[k] for k in ("score", "wer", "tail", "dur_ratio", "cos", "heard", "hallucination")})
                     L.pop("suspect", None)   # проверена оценкой — снимаем отметку «на проверку»
-            j["pos"] = len(rows)
         if ch: save_state(S)
 def spawn(jid, kind, py, append=False, idx=0):
     jd = ST / "jobs" / jid
@@ -369,9 +400,14 @@ def auto_loop():   # фоновый конвейер: берёт следующ�
                     if r["n"]: break
             else: AUTO["on"] = False; AUTO["stage"] = 0; AUTO["msg"] = "всё сделано"
         except Exception as e: AUTO["msg"] = f"ошибка: {e}"; AUTO["on"] = False
+_INS = [0.0, set()]
+def installed_set():   # содержимое папки игры: глоб тысяч файлов на каждый опрос — кэш на 10 с
+    if time.time() - _INS[0] > 10:
+        gd = Path(CFG["game_dir"]); _INS[:] = [time.time(), {p.stem for p in gd.glob("*.*")} if gd.exists() else set()]
+    return _INS[1]
 def light_lines(S=None):
     """все реплики в лёгком виде (для этапов, фильтров, счётчиков)"""
-    S = S or load_state(); ru = rd_tsv(W / "texts.tsv"); gd = Path(CFG["game_dir"]); inst = {p.stem for p in gd.glob("*.*")} if gd.exists() else set(); out = []
+    S = S or load_state(); ru = rd_tsv(W / "texts.tsv"); inst = installed_set(); out = []
     for n in sorted(set(ru) | set(S["lines"])):
         L = S["lines"].get(n, {}); out.append({"name": n, "text": L.get("text") or ru.get(n, ""), "takes": L.get("takes", []), "chosen": L.get("chosen"), "flag": L.get("flag"), "suspect": L.get("suspect"), "installed": n in inst})
     return out
@@ -391,11 +427,26 @@ def take_ts(t):
     if t.get("ts"): return t["ts"]
     try: return os.path.getmtime(t["file"])   # старые дубли без ts — по времени файла
     except Exception: return 0
-def state_json(q="", flt="all", limit=300, off=0, sort=""):
+_SIX = {"k": None, "tr": {}, "sub": {}}
+def search_index(LG, tl, dub):
+    """строки для поиска в нижнем регистре: перевод другого автора и субтитры оригинала; пересобираются только при смене tsv"""
+    k = tuple(id(tl[l]) for l in LG) + (id(dub),)
+    if _SIX["k"] != k:
+        _SIX["sub"] = {}
+        for l in LG:
+            for n, t in tl[l].items(): _SIX["sub"][n] = _SIX["sub"].get(n, "") + "\n" + t.lower()
+        _SIX["tr"] = {n: t.lower() for n, t in dub.items()}; _SIX["k"] = k
+    return _SIX
+def state_json(q="", flt="all", limit=300, off=0, sort="", where="all"):
     ingest(); S = load_state(); ru = rd_tsv(W / "texts.tsv"); LG = langs(); tl = {l: rd_tsv(W / f"texts_{l}.tsv") for l in LG}; dub = rd_tsv(W / "texts_dub.tsv")
-    allv = light_lines(S); q = q.lower()
+    allv = light_lines(S); q = q.lower().strip(); IX = search_index(LG, tl, dub) if q else None
+    def hit(l):   # where: name — имя файла, text — перевод (наш текст и другого автора), sub — субтитры оригинала, all — везде
+        n = l["name"]
+        if where in ("all", "name") and q in n.lower(): return True
+        if where in ("all", "text") and (q in l["text"].lower() or q in IX["tr"].get(n, "")): return True
+        return where in ("all", "sub") and q in IX["sub"].get(n, "")
     def ok(l):
-        if q and q not in (l["text"] + l["name"] + " ".join(tl[k].get(l["name"], "") for k in LG)).lower(): return False
+        if q and not hit(l): return False
         st = status_of(l)
         return flt == "all" or (flt == "none" and st == "no") or (flt == "dub" and st == "dub") or (flt == "bad" and st == "bad") or (flt == "unscored" and st == "in") or (flt == "inst" and l["installed"]) or (flt == "flagbad" and l["flag"] == "bad") or (flt == "regen" and l["flag"] == "regen") or (flt == "suspect" and l.get("suspect"))
     vis = [l for l in allv if ok(l)]; lines = []
@@ -494,7 +545,7 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         u = urllib.parse.urlparse(self.path); q = urllib.parse.parse_qs(u.query); path = urllib.parse.unquote(u.path)
         if path == "/": return self.send(200, (HERE / "index.html").read_bytes(), "text/html")
-        if path == "/api/state": return self.send(200, state_json(q.get("q", [""])[0], q.get("flt", ["all"])[0], int(q.get("limit", ["300"])[0]), int(q.get("off", ["0"])[0]), q.get("sort", [""])[0]))
+        if path == "/api/state": return self.send(200, state_json(q.get("q", [""])[0], q.get("flt", ["all"])[0], int(q.get("limit", ["300"])[0]), int(q.get("off", ["0"])[0]), q.get("sort", [""])[0], q.get("in", ["all"])[0]))
         if path == "/api/browse": return self.send(200, browse(q.get("path", [""])[0]))
         if path == "/api/ping": return self.send(200, {"ok": 1, "pid": os.getpid(), "started": START_T})
         if path == "/api/log":
@@ -601,6 +652,7 @@ class H(BaseHTTPRequestHandler):
             return self.send(200, {"removed": n})
         if u.path == "/api/restart":
             def _re():
+                flush_state()
                 RESUME_F.write_text("[]", encoding="utf-8")   # сначала: иначе scale_loop возобновит генерацию после остановки расшифровки
                 for j in list(JOBS.values()):   # перезапуск = чистый лист: все проходы останавливаются, модели выгружаются из памяти (продолжить можно кнопкой «продолжить» — готовое пропустится)
                     try:
@@ -628,5 +680,5 @@ class H(BaseHTTPRequestHandler):
             return self.send(200, {"ok": 1})
         self.send(404, {"error": "?"})
 if __name__ == "__main__":
-    load_old_jobs(); threading.Thread(target=auto_loop, daemon=True).start(); threading.Thread(target=autoinst_loop, daemon=True).start(); threading.Thread(target=scale_loop, daemon=True).start()
+    load_old_jobs(); threading.Thread(target=auto_loop, daemon=True).start(); threading.Thread(target=autoinst_loop, daemon=True).start(); threading.Thread(target=scale_loop, daemon=True).start(); threading.Thread(target=flush_loop, daemon=True).start()
     print(f"VoiceStudio: http://{CFG['host']}:{CFG['port']}  (work={W})", flush=True); SRV = ThreadingHTTPServer((CFG["host"], CFG["port"]), H); SRV.serve_forever()
